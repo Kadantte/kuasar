@@ -14,7 +14,10 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::{os::unix::prelude::FromRawFd, process::Stdio};
+use std::{
+    os::{fd::IntoRawFd, unix::prelude::FromRawFd},
+    process::Stdio,
+};
 
 use containerd_shim::{
     io_error,
@@ -23,7 +26,11 @@ use containerd_shim::{
 };
 use futures::StreamExt;
 use log::{debug, error};
-use nix::{pty::openpty, unistd::setsid};
+use nix::{
+    pty::openpty,
+    sys::signal::{kill, Signal},
+    unistd::{setsid, Pid},
+};
 use tokio::process::Command;
 use tokio_vsock::VsockStream;
 
@@ -34,6 +41,7 @@ pub async fn listen_debug_console(addr: &str) -> Result<()> {
     tokio::spawn(async move {
         let mut incoming = l.incoming();
         while let Some(Ok(s)) = incoming.next().await {
+            debug!("get a debug console request");
             if let Err(e) = debug_console(s).await {
                 error!("failed to open debug console {:?}", e);
             }
@@ -47,9 +55,10 @@ pub async fn debug_console(stream: VsockStream) -> Result<()> {
     let pty = openpty(None, None)?;
     let pty_master = pty.master;
     let mut cmd = Command::new("/bin/bash");
-    cmd.stdin(unsafe { Stdio::from_raw_fd(pty.slave) });
-    cmd.stdout(unsafe { Stdio::from_raw_fd(pty.slave) });
-    cmd.stderr(unsafe { Stdio::from_raw_fd(pty.slave) });
+    let pty_fd = pty.slave.into_raw_fd();
+    cmd.stdin(unsafe { Stdio::from_raw_fd(pty_fd) });
+    cmd.stdout(unsafe { Stdio::from_raw_fd(pty_fd) });
+    cmd.stderr(unsafe { Stdio::from_raw_fd(pty_fd) });
     unsafe {
         cmd.pre_exec(move || {
             setsid()?;
@@ -74,6 +83,7 @@ pub async fn debug_console(stream: VsockStream) -> Result<()> {
             }
         }
         if let Some(id) = child.id() {
+            kill(Pid::from_raw(id as i32), Signal::SIGKILL).unwrap_or_default();
             let exit_status = wait_pid(id as i32, s).await;
             debug!("debug console shell exit with {}", exit_status)
         }

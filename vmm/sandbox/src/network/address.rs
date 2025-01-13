@@ -15,7 +15,6 @@ limitations under the License.
 */
 
 use std::{
-    convert::TryInto,
     fmt::{Debug, Formatter},
     net::{IpAddr, Ipv4Addr, Ipv6Addr},
     str::FromStr,
@@ -23,6 +22,7 @@ use std::{
 
 use anyhow::anyhow;
 use containerd_sandbox::error::Result;
+use netlink_packet_route::route::RouteAddress;
 use serde_derive::{Deserialize, Serialize};
 
 #[derive(Default, Debug, Clone, Deserialize, Serialize)]
@@ -110,7 +110,7 @@ impl IpNet {
     }
 }
 
-#[derive(Default, Clone, Deserialize, Serialize)]
+#[derive(Default, Debug, Clone, Deserialize, Serialize)]
 #[serde(from = "String")]
 #[serde(into = "String")]
 pub struct MacAddress(pub(crate) Vec<u8>);
@@ -131,32 +131,20 @@ impl From<MacAddress> for String {
     }
 }
 
-impl ToString for MacAddress {
-    fn to_string(&self) -> String {
+impl std::fmt::Display for MacAddress {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         let mut segs = vec![];
         for u in self.0.as_slice() {
             segs.push(format!("{:02x}", u));
         }
-        segs.join(":")
+        write!(f, "{}", segs.join(":"))
     }
 }
 
-impl Debug for MacAddress {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.to_string())
+pub fn convert_to_ip_address(address: RouteAddress) -> Result<IpAddr> {
+    match address {
+        RouteAddress::Inet(addr) => Ok(IpAddr::V4(addr)),
+        RouteAddress::Inet6(addr) => Ok(IpAddr::V6(addr)),
+        _ => Err(anyhow!("unsupported ip address {:?}", address).into()),
     }
-}
-
-pub fn convert_to_ip_address(addr: Vec<u8>) -> Result<IpAddr> {
-    if addr.len() == 4 {
-        let arr: &[u8; 4] = addr.as_slice().try_into().unwrap();
-        let address = IpAddr::from(*arr);
-        return Ok(address);
-    }
-    if addr.len() == 16 {
-        let arr: &[u8; 16] = addr.as_slice().try_into().unwrap();
-        let address = IpAddr::from(*arr);
-        return Ok(address);
-    }
-    Err(anyhow!("ip address vec has length {}", addr.len()).into())
 }

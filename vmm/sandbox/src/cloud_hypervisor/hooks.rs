@@ -20,6 +20,7 @@ use crate::{
     cloud_hypervisor::CloudHypervisorVM, sandbox::KuasarSandbox, utils::get_resources, vm::Hooks,
 };
 
+#[derive(Default)]
 pub struct CloudHypervisorHooks {}
 
 #[async_trait::async_trait]
@@ -31,7 +32,7 @@ impl Hooks<CloudHypervisorVM> for CloudHypervisorHooks {
     }
 
     async fn post_start(&self, sandbox: &mut KuasarSandbox<CloudHypervisorVM>) -> Result<()> {
-        sandbox.data.task_address = sandbox.vm.agent_socket.to_string();
+        sandbox.data.task_address = format!("ttrpc+{}", sandbox.vm.agent_socket);
         // sync clock
         sandbox.sync_clock().await;
         Ok(())

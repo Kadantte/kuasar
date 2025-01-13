@@ -17,7 +17,10 @@ jobs:
         include:
           - directories: wasm
             features: --features=wasmedge
-            wasmEdge: 0.11.2
+            wasmEdge: 0.13.5
+          - directories: wasm
+            features: --features="wasmedge, wasmedge_wasi_nn"
+            wasmEdge: 0.13.5
           - directories: wasm
             features: --features=wasmtime
     runs-on: ubuntu-latest
@@ -26,6 +29,7 @@ jobs:
     steps:
       - uses: actions/checkout@v3
       - run: rustup toolchain install nightly --component rustfmt
+      - run: rustup show
       - name: Install Protoc
         uses: arduino/setup-protoc@v1.1.2
         with:
@@ -44,7 +48,7 @@ jobs:
         run: cargo clippy ${{ matrix.features }} -- -D warnings
       - name: Deny
         working-directory: ${{ matrix.directories }}
-        run: cargo install cargo-deny && cargo deny -L warn ${{ matrix.features }} check
+        run: cargo install cargo-deny@0.15.1 && cargo deny -L warn ${{ matrix.features }} check
 
   tests:
     strategy:
@@ -54,7 +58,7 @@ jobs:
         include:
           - directories: wasm
             features: --features=wasmedge
-            wasmEdge: 0.11.2
+            wasmEdge: 0.13.5
           - directories: wasm
             features: --features=wasmtime
     runs-on: ubuntu-latest
@@ -68,9 +72,10 @@ jobs:
           repo-token: ${{ secrets.GITHUB_TOKEN }}
       - name: Install WasmEdge
         if: ${{ matrix.wasmEdge }}
-        run: curl -sSf https://raw.githubusercontent.com/WasmEdge/WasmEdge/master/utils/install.sh | bash -s -- -v ${{ matrix.wasmEdge }} >> /dev/null
+        run: curl -sSf https://raw.githubusercontent.com/WasmEdge/WasmEdge/master/utils/install.sh | sudo -E bash -s -- -v ${{ matrix.wasmEdge }} >> /dev/null
       - name: Test
         env:
           RUST_BACKTRACE: full
+          RUSTFLAGS: -D warnings
         working-directory: ${{ matrix.directories }}
         run: sudo -E $(command -v cargo) test ${{ matrix.features }}
