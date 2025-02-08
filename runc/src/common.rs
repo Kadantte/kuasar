@@ -14,7 +14,16 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::{io::IoSliceMut, ops::Deref, os::unix::io::RawFd, path::Path, sync::Arc};
+use std::{
+    io::IoSliceMut,
+    ops::Deref,
+    os::{
+        fd::{FromRawFd, OwnedFd},
+        unix::io::RawFd,
+    },
+    path::Path,
+    sync::Arc,
+};
 
 use anyhow::anyhow;
 use containerd_shim::{
@@ -42,7 +51,6 @@ use runc::{
 pub const INIT_PID_FILE: &str = "init.pid";
 
 pub struct ProcessIO {
-    pub uri: Option<String>,
     pub io: Option<Arc<dyn Io>>,
     pub copy: bool,
 }
@@ -56,7 +64,6 @@ pub fn create_io(
     if stdio.is_null() {
         let nio = NullIo::new().map_err(io_error!(e, "new Null Io"))?;
         let pio = ProcessIO {
-            uri: None,
             io: Some(Arc::new(nio)),
             copy: false,
         };
@@ -64,20 +71,15 @@ pub fn create_io(
     }
     let stdout = stdio.stdout.as_str();
     let scheme_path = stdout.trim().split("://").collect::<Vec<&str>>();
-    let scheme: &str;
-    let uri: String;
-    if scheme_path.len() <= 1 {
+    let scheme = if scheme_path.len() <= 1 {
         // no scheme specified
         // default schema to fifo
-        uri = format!("fifo://{}", stdout);
-        scheme = "fifo"
+        "fifo"
     } else {
-        uri = stdout.to_string();
-        scheme = scheme_path[0];
-    }
+        scheme_path[0]
+    };
 
     let mut pio = ProcessIO {
-        uri: Some(uri),
         io: None,
         copy: false,
     };
@@ -171,7 +173,7 @@ pub fn create_runc(
 #[derive(Default)]
 pub(crate) struct CreateConfig {}
 
-pub fn receive_socket(stream_fd: RawFd) -> containerd_shim::Result<RawFd> {
+pub fn receive_socket(stream_fd: RawFd) -> containerd_shim::Result<OwnedFd> {
     let mut buf = [0u8; 4096];
     let mut iovec = [IoSliceMut::new(&mut buf)];
     let mut space = cmsg_space!([RawFd; 2]);
@@ -201,8 +203,9 @@ pub fn receive_socket(stream_fd: RawFd) -> containerd_shim::Result<RawFd> {
         "copy_console: console socket get path: {}, fd: {}",
         path, &fds[0]
     );
-    tcgetattr(fds[0])?;
-    Ok(fds[0])
+    let fd = unsafe { OwnedFd::from_raw_fd(fds[0]) };
+    tcgetattr(&fd)?;
+    Ok(fd)
 }
 
 pub fn has_shared_pid_namespace(spec: &Spec) -> bool {

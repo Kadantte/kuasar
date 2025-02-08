@@ -15,26 +15,53 @@ limitations under the License.
 */
 
 use clap::Parser;
-use vmm_sandboxer::{args, stratovirt::init_stratovirt_sandboxer, utils::init_logger, version};
+use vmm_common::{signal, trace};
+use vmm_sandboxer::{
+    args,
+    config::Config,
+    sandbox::KuasarSandboxer,
+    stratovirt::{
+        config::StratoVirtVMConfig, factory::StratoVirtVMFactory, hooks::StratoVirtHooks,
+    },
+    version,
+};
 
 #[tokio::main]
-async fn main() -> anyhow::Result<()> {
+async fn main() {
     let args = args::Args::parse();
     if args.version {
         version::print_version_info();
-        return Ok(());
+        return;
     }
 
-    // Initialize sandboxer
-    let sandboxer = init_stratovirt_sandboxer(&args).await?;
+    let config: Config<StratoVirtVMConfig> = Config::load_config(&args.config).await.unwrap();
 
-    // Initialize log
-    init_logger(sandboxer.log_level());
+    // Update args log level if it not presents args but in config.
+    let log_level = config.sandbox.log_level();
+    let service_name = "kuasar-vmm-sandboxer-stratovirt-service";
+    trace::set_enabled(config.sandbox.enable_tracing);
+    trace::setup_tracing(&log_level, service_name).unwrap();
+
+    let mut sandboxer: KuasarSandboxer<StratoVirtVMFactory, StratoVirtHooks> = KuasarSandboxer::new(
+        config.sandbox,
+        config.hypervisor.clone(),
+        StratoVirtHooks::new(config.hypervisor),
+    );
+
+    tokio::spawn(async move {
+        signal::handle_signals(&log_level, service_name).await;
+    });
+
+    // Do recovery job
+    sandboxer.recover(&args.dir).await;
 
     // Run the sandboxer
-    containerd_sandbox::run("kuasar-sandboxer", sandboxer)
-        .await
-        .unwrap();
-
-    Ok(())
+    containerd_sandbox::run(
+        "kuasar-vmm-sandboxer-stratovirt",
+        &args.listen,
+        &args.dir,
+        sandboxer,
+    )
+    .await
+    .unwrap();
 }

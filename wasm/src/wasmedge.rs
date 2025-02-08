@@ -14,8 +14,6 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-#![cfg(feature = "wasmedge")]
-
 use std::{
     fs::OpenOptions,
     os::unix::prelude::{IntoRawFd, RawFd},
@@ -53,7 +51,10 @@ use oci_spec::runtime::Spec;
 use wasmedge_sdk::{
     config::{CommonConfigOptions, ConfigBuilder, HostRegistrationConfigOptions},
     error::WasmEdgeError,
-    params, PluginManager, Vm,
+    params,
+    plugin::PluginManager,
+    wasi::WasiInstance,
+    Vm, VmBuilder,
 };
 
 use crate::utils::{get_args, get_cgroup_path, get_envs, get_preopens, get_rootfs};
@@ -83,22 +84,18 @@ pub struct WasmEdgeContainerFactory {
 
 impl Default for WasmEdgeContainerFactory {
     fn default() -> Self {
-        PluginManager::load_from_default_paths();
+        PluginManager::load(None).unwrap();
         let mut host_options = HostRegistrationConfigOptions::default();
         host_options = host_options.wasi(true);
-        #[cfg(all(
-            target_os = "linux",
-            feature = "wasmedge_wasi_nn",
-            target_arch = "x86_64"
-        ))]
-        {
-            host_options = host_options.wasi_nn(true);
-        }
         let config = ConfigBuilder::new(CommonConfigOptions::default())
             .with_host_registration_config(host_options)
             .build()
             .unwrap();
-        let vm = Vm::new(Some(config)).map_err(anyhow::Error::msg).unwrap();
+        let vm = VmBuilder::new()
+            .with_config(config)
+            .build()
+            .map_err(anyhow::Error::msg)
+            .unwrap();
         Self {
             prototype_vm: vm,
             netns: "".to_string(),
@@ -156,7 +153,10 @@ impl ContainerFactory<WasmEdgeContainer> for WasmEdgeContainerFactory {
 impl ProcessLifecycle<InitProcess> for WasmEdgeInitLifecycle {
     async fn start(&self, p: &mut InitProcess) -> containerd_shim::Result<()> {
         let spec = &p.lifecycle.spec;
-        let vm = p.lifecycle.prototype_vm.clone();
+        // Allow vm to be mutable since we change it in wasmedge_wasi_nn feature
+        #[allow(unused_mut)]
+        #[allow(unused_assignments)]
+        let mut vm = p.lifecycle.prototype_vm.clone();
         let args = get_args(spec);
         let envs = get_envs(spec);
         let rootfs = get_rootfs(spec).ok_or_else(|| {
@@ -192,6 +192,45 @@ impl ProcessLifecycle<InitProcess> for WasmEdgeInitLifecycle {
                         e,
                         format!("failed to add task to cgroup: {}", cgroup_path)
                     ))?;
+                }
+                // Only create new VM instance on wasmedge_wasi_nn feature
+                #[cfg(all(
+                    target_os = "linux",
+                    feature = "wasmedge_wasi_nn",
+                    target_arch = "x86_64"
+                ))]
+                {
+                    const NN_PRELOAD_KEY: &str = "io.kuasar.wasm.nn_preload";
+                    if let Some(process) = p.lifecycle.spec.process() {
+                        if let Some(env) = process.env() {
+                            if let Some(v) =
+                                env.iter().find(|k| k.contains(&NN_PRELOAD_KEY.to_string()))
+                            {
+                                if let Some(nn_preload) =
+                                    v.strip_prefix::<&str>(format!("{}=", NN_PRELOAD_KEY).as_ref())
+                                {
+                                    log::info!("found nn_pre_load: {}", nn_preload);
+                                    if let Some(rootfs) = spec.root().as_ref() {
+                                        pre_load_with_new_rootfs(nn_preload, rootfs.path())
+                                            .unwrap();
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    let host_options = HostRegistrationConfigOptions::default().wasi(true);
+                    let config = ConfigBuilder::new(CommonConfigOptions::default())
+                        .with_host_registration_config(host_options)
+                        .build()
+                        .map_err(other_error!(e, "generate default wasmedge config"))?;
+
+                    vm = VmBuilder::new()
+                        .with_config(config)
+                        .with_plugin_wasi_nn()
+                        .with_plugin("wasi_logging", None)
+                        .build()
+                        .unwrap();
                 }
                 match run_wasi_func(vm, args, envs, preopens, p) {
                     Ok(_) => exit(0),
@@ -341,15 +380,17 @@ pub enum RunError {
     WasmEdge(Box<WasmEdgeError>),
     IO(std::io::Error),
     NoRootInSpec,
+    NoModule,
     Sys(Errno),
 }
 
 impl RunError {
     pub fn to_exit_code(&self) -> i32 {
         match &self {
-            RunError::WasmEdge(_) => -100,
-            RunError::IO(_) => -101,
+            RunError::WasmEdge(_e) => -100,
+            RunError::IO(_e) => -101,
             RunError::NoRootInSpec => -102,
+            RunError::NoModule => -103,
             RunError::Sys(e) => -(*e as i32),
         }
     }
@@ -368,7 +409,7 @@ fn run_wasi_func(
             nix::fcntl::open(netns, OFlag::O_CLOEXEC, Mode::empty()).map_err(RunError::Sys)?;
         setns(netns_fd, CloneFlags::CLONE_NEWNET).map_err(RunError::Sys)?;
     }
-    let mut wasi_instance = vm.wasi_module().map_err(RunError::WasmEdge)?;
+    let wasi_instance: &mut WasiInstance = vm.wasi_module_mut().ok_or(RunError::NoModule)?;
     wasi_instance.initialize(
         Some(args.iter().map(|s| s as &str).collect()),
         Some(envs.iter().map(|s| s as &str).collect()),
@@ -453,4 +494,37 @@ pub async fn process_exits<F>(task: &TaskService<F, WasmEdgeContainer>) {
             }
         }
     });
+}
+
+#[cfg(all(
+    target_os = "linux",
+    feature = "wasmedge_wasi_nn",
+    target_arch = "x86_64"
+))]
+fn pre_load_with_new_rootfs(
+    preload: &str,
+    rootfs: &std::path::PathBuf,
+) -> Result<(), WasmEdgeError> {
+    use wasmedge_sdk::plugin::{ExecutionTarget, GraphEncoding};
+    let nn_preload: Vec<&str> = preload.split(':').collect();
+    if nn_preload.len() != 4 {
+        return Err(WasmEdgeError::Operation(format!(
+            "Failed to convert to NNPreload value. Invalid preload string: {}. The correct format is: 'alias:backend:target:path'",
+            preload
+        )));
+    }
+    let (alias, backend, target, path) = (
+        nn_preload[0].to_string(),
+        nn_preload[1]
+            .parse::<GraphEncoding>()
+            .map_err(|err| WasmEdgeError::Operation(err.to_string()))?,
+        nn_preload[2]
+            .parse::<ExecutionTarget>()
+            .map_err(|err| WasmEdgeError::Operation(err.to_string()))?,
+        std::path::Path::new(rootfs).join(nn_preload[3]),
+    );
+    PluginManager::nn_preload(vec![wasmedge_sdk::plugin::NNPreload::new(
+        alias, backend, target, path,
+    )]);
+    Ok(())
 }

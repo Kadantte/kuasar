@@ -6,8 +6,6 @@
 
 set -e
 
-[ -n "${DEBUG}" ] && set -x
-
 DOCKER_RUNTIME=${DOCKER_RUNTIME:-runc}
 
 readonly script_name="${0##*/}"
@@ -64,7 +62,7 @@ AGENT_INIT=${AGENT_INIT:-yes}
 
 # Align image to (size in MB) according to different architecture.
 case "$(uname -m)" in
-	aarch64) readonly mem_boundary_mb=16 ;;
+	aarch64) readonly mem_boundary_mb=128 ;;
 	*) readonly mem_boundary_mb=128 ;;
 esac
 
