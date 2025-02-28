@@ -14,31 +14,59 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::{ops::Add, sync::Arc, time::Duration};
+use std::{
+    ops::Add,
+    process::Stdio,
+    sync::Arc,
+    time::{Duration, SystemTime},
+};
 
 use async_trait::async_trait;
-use containerd_shim::{error::Result, Error, TtrpcContext, TtrpcResult};
+use containerd_sandbox::PodSandboxConfig;
+use containerd_shim::{
+    error::Result,
+    io_error, other, other_error,
+    protos::{protobuf::MessageDyn, topics::TASK_OOM_EVENT_TOPIC},
+    util::convert_to_any,
+    Error, TtrpcContext, TtrpcResult,
+};
+use log::debug;
 use nix::{
     sys::time::{TimeSpec, TimeValLike},
     time::{clock_gettime, clock_settime, ClockId},
 };
-use tokio::sync::Mutex;
+use tokio::{
+    io::AsyncWriteExt,
+    sync::{mpsc::Receiver, Mutex},
+};
 use vmm_common::{
     api,
-    api::{empty::Empty, sandbox::*},
+    api::{
+        empty::Empty,
+        events::Envelope,
+        sandbox::{
+            CheckRequest, ExecVMProcessRequest, ExecVMProcessResponse, SetupSandboxRequest,
+            SyncClockPacket, UpdateInterfacesRequest, UpdateRoutesRequest,
+        },
+    },
 };
 
-use crate::netlink::Handle;
+use crate::{netlink::Handle, sandbox::setup_sandbox, NAMESPACE};
 
 pub struct SandboxService {
+    pub namespace: String,
     pub handle: Arc<Mutex<Handle>>,
+    #[allow(clippy::type_complexity)]
+    pub rx: Arc<Mutex<Receiver<(String, Box<dyn MessageDyn>)>>>,
 }
 
 impl SandboxService {
-    pub fn new() -> Result<Self> {
+    pub fn new(rx: Receiver<(String, Box<dyn MessageDyn>)>) -> Result<Self> {
         let handle = Handle::new()?;
         Ok(Self {
+            namespace: NAMESPACE.to_string(),
             handle: Arc::new(Mutex::new(handle)),
+            rx: Arc::new(Mutex::new(rx)),
         })
     }
 
@@ -71,6 +99,44 @@ impl api::sandbox_ttrpc::SandboxService for SandboxService {
         Ok(Empty::new())
     }
 
+    async fn setup_sandbox(
+        &self,
+        _ctx: &TtrpcContext,
+        req: SetupSandboxRequest,
+    ) -> TtrpcResult<Empty> {
+        match req.config.type_url.as_str() {
+            "PodSandboxConfig" => {
+                let config =
+                    serde_json::from_slice::<PodSandboxConfig>(req.config.value.as_slice())
+                        .map_err(|e| {
+                            ttrpc::Error::Others(format!("convert PodSandboxConfig failed: {}", e))
+                        })?;
+                setup_sandbox(&config).await?;
+            }
+            _ => {
+                return Err(ttrpc::Error::RpcStatus(ttrpc::get_status(
+                    ::ttrpc::Code::NOT_FOUND,
+                    format!(
+                        "SetUpSandbox/config/{} is not supported",
+                        &req.config.type_url
+                    ),
+                )));
+            }
+        }
+
+        // Set interfaces
+        self.handle
+            .lock()
+            .await
+            .update_interfaces(req.interfaces)
+            .await?;
+
+        // Set Routes
+        self.handle.lock().await.update_routes(req.routes).await?;
+
+        Ok(Empty::new())
+    }
+
     async fn check(&self, _ctx: &TtrpcContext, _req: CheckRequest) -> TtrpcResult<Empty> {
         Ok(Empty::new())
     }
@@ -78,12 +144,13 @@ impl api::sandbox_ttrpc::SandboxService for SandboxService {
     async fn exec_vm_process(
         &self,
         _ctx: &TtrpcContext,
-        _req: ExecVMProcessRequest,
+        req: ExecVMProcessRequest,
     ) -> TtrpcResult<ExecVMProcessResponse> {
-        Err(::ttrpc::Error::RpcStatus(::ttrpc::get_status(
-            ::ttrpc::Code::NOT_FOUND,
-            "/grpc.SandboxService/ExecVMProcess is not supported".to_string(),
-        )))
+        let out = do_execute_cmd(&req.command, req.stdin.as_slice()).await?;
+
+        let mut resp = ExecVMProcessResponse::new();
+        resp.out = out;
+        Ok(resp)
     }
 
     async fn sync_clock(
@@ -111,5 +178,65 @@ impl api::sandbox_ttrpc::SandboxService for SandboxService {
             }
         }
         Ok(resp)
+    }
+
+    async fn get_events(&self, _ctx: &TtrpcContext, _: Empty) -> TtrpcResult<Envelope> {
+        while let Some((topic, event)) = self.rx.lock().await.recv().await {
+            debug!("received event {:?}", event);
+            // Only OOM Event is supported.
+            // TODO: Support all topic
+            if topic != TASK_OOM_EVENT_TOPIC {
+                continue;
+            }
+
+            let mut resp = Envelope::new();
+            resp.set_timestamp(SystemTime::now().into());
+            resp.set_namespace(self.namespace.to_string());
+            resp.set_topic(topic);
+            resp.set_event(convert_to_any(event).unwrap());
+            return Ok(resp);
+        }
+
+        Err(ttrpc::Error::Others("internal".to_string()))
+    }
+}
+
+async fn do_execute_cmd(cmd_args: &str, stdin: &[u8]) -> Result<String> {
+    let mut cmd = tokio::process::Command::new("/bin/bash");
+    cmd.arg("-c");
+    cmd.arg(cmd_args);
+    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+    if !stdin.is_empty() {
+        cmd.stdin(Stdio::piped());
+    }
+
+    let mut child = cmd
+        .spawn()
+        .map_err(io_error!(e, "spawn exec vm process failed:"))?;
+    if !stdin.is_empty() {
+        let cmd_in = child.stdin.as_mut().ok_or(other!("no stdin for command"))?;
+        cmd_in
+            .write_all(stdin)
+            .await
+            .map_err(io_error!(e, "failed to write vm process stdin:"))?;
+    }
+
+    let output = child
+        .wait_with_output()
+        .await
+        .map_err(io_error!(e, "failed to combined process output:"))?;
+    if output.status.success() {
+        let raw_output =
+            String::from_utf8(output.stdout).map_err(other_error!(e, "failed to convert"))?;
+        Ok(raw_output)
+    } else {
+        let err_msg =
+            String::from_utf8(output.stderr).map_err(other_error!(e, "failed to convert"))?;
+        Err(other!(
+            "cmd {} failed with status {:?} and error message {}",
+            cmd_args,
+            output.status,
+            err_msg
+        ))
     }
 }

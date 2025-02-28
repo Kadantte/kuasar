@@ -8,7 +8,7 @@ edition = "2021"
 panic = 'abort'
 
 [dependencies]
-containerd-sandbox = {git="https://github.com/kuasar-io/rust-extensions.git"}
+containerd-sandbox = { git = "https://github.com/kuasar-io/rust-extensions.git" }
 serde = "1.0.139"
 lazy_static = "1.4.0"
 nix = "0.24.1"
@@ -18,6 +18,16 @@ ttrpc = { version = "0.7", features = ["async"] }
 protobuf = "3.2"
 async-trait = "0.1"
 regex = "1.5.6"
+futures = { version = "0.3.21" }
+signal-hook-tokio = { version = "0.3.1", features = ["futures-v0_3"] }
+
+tracing = "0.1.40"
+tracing-opentelemetry = "0.21.0"
+tracing-subscriber = { version = "0.3.18", features = ["env-filter"] }
+
+opentelemetry = { version = "0.20.0", features = ["rt-tokio"] }
+opentelemetry-otlp = "0.13.0"
 
 [build-dependencies]
-ttrpc-codegen = "0.4"
+ttrpc-codegen = { git = "https://github.com/kuasar-io/ttrpc-rust.git", branch = "v0.7.1-kuasar" }
+tonic-build = "0.7.2"

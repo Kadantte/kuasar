@@ -134,7 +134,7 @@ impl Default for HypervisorCommonConfig {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Deserialize)]
 #[allow(clippy::enum_variant_names)]
 pub enum BlockDriver {
     VirtioBlk,
@@ -184,7 +184,7 @@ impl BlockDriver {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Deserialize)]
 pub enum ShareFsType {
     Virtio9P,
     VirtioFS,
@@ -210,5 +210,5 @@ pub struct VcpuThreads {
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct Pids {
     pub vmm_pid: Option<u32>,
-    pub affilicated_pids: Vec<u32>,
+    pub affiliated_pids: Vec<u32>,
 }

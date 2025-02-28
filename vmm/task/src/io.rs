@@ -17,19 +17,22 @@
 use std::{
     io::{ErrorKind, IoSliceMut},
     ops::Deref,
-    os::unix::prelude::{AsRawFd, FromRawFd, RawFd},
+    os::{
+        fd::{IntoRawFd, OwnedFd},
+        unix::prelude::{AsRawFd, FromRawFd, RawFd},
+    },
     path::PathBuf,
     pin::Pin,
     sync::Arc,
     task::{Context, Poll},
 };
 
+#[cfg(not(feature = "youki"))]
+use containerd_shim::util::IntoOption;
 use containerd_shim::{
     asynchronous::{console::ConsoleSocket, processes::ProcessTemplate, util::asyncify},
     io::Stdio,
-    io_error, other,
-    util::IntoOption,
-    Console, Error, ExitSignal, Result,
+    io_error, other, Console, Error, ExitSignal, Result,
 };
 use log::{debug, error, warn};
 use nix::{
@@ -39,23 +42,30 @@ use nix::{
         termios::tcgetattr,
     },
 };
-use runc::io::{IOOption, Io, NullIo, PipedIo, FIFO};
+use runc::io::Io;
+#[cfg(not(feature = "youki"))]
+use runc::io::{IOOption, NullIo, PipedIo, FIFO};
 use tokio::{
     fs::{File, OpenOptions},
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf},
 };
 use tokio_vsock::{VsockListener, VsockStream};
 
-use crate::{device::SYSTEM_DEV_PATH, vsock};
+use crate::{
+    device::SYSTEM_DEV_PATH,
+    streaming::{get_output, get_stdin, remove_channel},
+    vsock,
+};
 
 pub struct ProcessIO {
-    pub uri: Option<String>,
     pub io: Option<Arc<dyn Io>>,
     pub copy: bool,
 }
 
 const VSOCK: &str = "vsock";
+const STREAMING: &str = "streaming";
 
+#[cfg(not(feature = "youki"))]
 pub fn create_io(
     id: &str,
     io_uid: u32,
@@ -65,7 +75,6 @@ pub fn create_io(
     if stdio.is_null() {
         let nio = NullIo::new().map_err(io_error!(e, "new Null Io"))?;
         let pio = ProcessIO {
-            uri: None,
             io: Some(Arc::new(nio)),
             copy: false,
         };
@@ -73,20 +82,15 @@ pub fn create_io(
     }
     let stdout = stdio.stdout.as_str();
     let scheme_path = stdout.trim().split("://").collect::<Vec<&str>>();
-    let scheme: &str;
-    let uri: String;
-    if scheme_path.len() <= 1 {
+    let scheme = if scheme_path.len() <= 1 {
         // no scheme specified
         // default schema to fifo
-        uri = format!("fifo://{}", stdout);
-        scheme = "fifo"
+        "fifo"
     } else {
-        uri = stdout.to_string();
-        scheme = scheme_path[0];
-    }
+        scheme_path[0]
+    };
 
     let mut pio = ProcessIO {
-        uri: Some(uri),
         io: None,
         copy: false,
     };
@@ -106,7 +110,7 @@ pub fn create_io(
         };
         pio.io = Some(Arc::new(io));
         pio.copy = false;
-    } else if scheme.contains(VSOCK) {
+    } else {
         let opt = IOOption {
             open_stdin: !stdio.stdin.is_empty(),
             open_stdout: !stdio.stdout.is_empty(),
@@ -144,7 +148,7 @@ pub(crate) async fn copy_io_or_console<P>(
     Ok(())
 }
 
-async fn copy_console<P>(
+pub async fn copy_console<P>(
     p: &ProcessTemplate<P>,
     console_socket: &ConsoleSocket,
     stdio: &Stdio,
@@ -152,8 +156,8 @@ async fn copy_console<P>(
 ) -> Result<Console> {
     debug!("copy_console: waiting for runtime to send console fd");
     let stream = console_socket.accept().await?;
-    let fd = asyncify(move || -> Result<RawFd> { receive_socket(stream.as_raw_fd()) }).await?;
-    let f = unsafe { File::from_raw_fd(fd) };
+    let fd = asyncify(move || -> Result<OwnedFd> { receive_socket(stream.as_raw_fd()) }).await?;
+    let f = unsafe { File::from_raw_fd(fd.into_raw_fd()) };
     if !stdio.stdin.is_empty() {
         debug!("copy_console: pipe stdin to console");
 
@@ -242,7 +246,15 @@ where
 {
     let src = from;
     tokio::spawn(async move {
-        let dst: Box<dyn AsyncWrite + Unpin + Send> = if to.contains(VSOCK) {
+        let dst: Box<dyn AsyncWrite + Unpin + Send> = if to.contains(STREAMING) {
+            match get_output(&to).await {
+                Ok(output) => Box::new(output),
+                Err(e) => {
+                    error!("failed to get streaming by {}, {}", to, e);
+                    return;
+                }
+            }
+        } else if to.contains(VSOCK) {
             tokio::select! {
                 _ = exit_signal.wait() => {
                     debug!("container already exited, maybe nobody should connect vsock");
@@ -268,6 +280,9 @@ where
             }
         };
         copy(src, dst, exit_signal, on_close).await;
+        if to.contains(STREAMING) {
+            remove_channel(&to).await.unwrap_or_default();
+        }
         debug!("finished copy io from container to {}", to);
     });
     Ok(())
@@ -285,7 +300,15 @@ where
 {
     let dst = to;
     tokio::spawn(async move {
-        let src: Box<dyn AsyncRead + Unpin + Send> = if from.contains(VSOCK) {
+        let src: Box<dyn AsyncRead + Unpin + Send> = if from.contains(STREAMING) {
+            match get_stdin(&from).await {
+                Ok(stdin) => Box::new(stdin),
+                Err(e) => {
+                    error!("failed to get streaming by {}, {}", from, e);
+                    return;
+                }
+            }
+        } else if from.contains(VSOCK) {
             tokio::select! {
                 _ = exit_signal.wait() => {
                     debug!("container already exited, maybe nobody should connect");
@@ -311,6 +334,9 @@ where
             }
         };
         copy(src, dst, exit_signal, on_close).await;
+        if from.contains(STREAMING) {
+            remove_channel(&from).await.unwrap_or_default();
+        }
         debug!("finished copy io from {} to container", from);
     });
     Ok(())
@@ -363,7 +389,7 @@ where
     }
 }
 
-pub fn receive_socket(stream_fd: RawFd) -> containerd_shim::Result<RawFd> {
+pub fn receive_socket(stream_fd: RawFd) -> Result<OwnedFd> {
     let mut buf = [0u8; 4096];
     let mut iovec = [IoSliceMut::new(&mut buf)];
     let mut space = cmsg_space!([RawFd; 2]);
@@ -393,8 +419,9 @@ pub fn receive_socket(stream_fd: RawFd) -> containerd_shim::Result<RawFd> {
         "copy_console: console socket get path: {}, fd: {}",
         path, &fds[0]
     );
-    tcgetattr(fds[0])?;
-    Ok(fds[0])
+    let fd = unsafe { OwnedFd::from_raw_fd(fds[0]) };
+    tcgetattr(&fd)?;
+    Ok(fd)
 }
 
 // TODO we still have to create pipes, otherwise the device maybe opened multiple times in container,

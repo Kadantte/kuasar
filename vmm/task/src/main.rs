@@ -14,33 +14,38 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::{collections::HashMap, convert::TryFrom, path::Path, str::FromStr, sync::Arc, thread};
+#![warn(clippy::expect_fun_call, clippy::expect_used)]
 
+use std::{collections::HashMap, convert::TryFrom, path::Path, process::exit, sync::Arc};
+
+use anyhow::anyhow;
 use containerd_shim::{
     asynchronous::{monitor::monitor_notify_by_pid, util::asyncify},
     error::Error,
     io_error, other,
     protos::{shim::shim_ttrpc_async::create_task, ttrpc::asynchronous::Server},
-    util::{mkdir, IntoOption},
+    util::IntoOption,
     Result,
 };
 use futures::StreamExt;
 use lazy_static::lazy_static;
-use log::{debug, error, info, warn, LevelFilter};
+use log::{debug, error, info, warn};
 use nix::{
     errno::Errno,
-    sched::{unshare, CloneFlags},
-    sys::{
-        wait,
-        wait::{WaitPidFlag, WaitStatus},
-    },
-    unistd::{getpid, gettid, Pid},
+    sched::CloneFlags,
+    sys::wait::{self, WaitPidFlag, WaitStatus},
+    unistd::Pid,
 };
 use signal_hook_tokio::Signals;
-use tokio::fs::File;
+use streaming::STREAMING_SERVICE;
+use tokio::sync::mpsc::channel;
+use tracing_subscriber::{
+    self, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter, Layer, Registry,
+};
 use vmm_common::{
-    api::sandbox_ttrpc::create_sandbox_service, mount::mount, ETC_RESOLV, HOSTNAME_FILENAME,
-    IPC_NAMESPACE, KUASAR_STATE_DIR, NET_NAMESPACE, RESOLV_FILENAME, SANDBOX_NS_PATH,
+    api::{sandbox_ttrpc::create_sandbox_service, streaming_ttrpc::create_streaming},
+    mount::mount,
+    trace, ETC_RESOLV, IPC_NAMESPACE, KUASAR_STATE_DIR, PID_NAMESPACE, RESOLV_FILENAME,
     UTS_NAMESPACE,
 };
 
@@ -53,6 +58,7 @@ use crate::{
 };
 
 mod config;
+#[cfg(not(feature = "youki"))]
 mod container;
 mod debug;
 mod device;
@@ -62,9 +68,14 @@ mod netlink;
 mod sandbox;
 mod sandbox_service;
 mod stream;
+mod streaming;
 mod task;
 mod util;
 mod vsock;
+#[cfg(feature = "youki")]
+mod youki;
+
+const NAMESPACE: &str = "k8s.io";
 
 #[derive(Debug, PartialEq, Eq, Clone)]
 pub struct StaticMount {
@@ -131,33 +142,27 @@ lazy_static! {
         options: vec!["relatime", "nodev", "sync", "dirsync",]
     },];
     static ref CLONE_FLAG_TABLE: HashMap<String, CloneFlags> = HashMap::from([
-        (String::from(NET_NAMESPACE), CloneFlags::CLONE_NEWNET),
         (String::from(IPC_NAMESPACE), CloneFlags::CLONE_NEWIPC),
         (String::from(UTS_NAMESPACE), CloneFlags::CLONE_NEWUTS),
+        (String::from(PID_NAMESPACE), CloneFlags::CLONE_NEWPID),
     ]);
 }
 
-#[tokio::main]
-async fn main() {
-    early_init_call().await.expect("early init call");
-    let config = TaskConfig::new().await.unwrap();
-    let log_level = LevelFilter::from_str(&config.log_level).unwrap();
-    env_logger::Builder::from_default_env()
-        .format_timestamp_micros()
-        .filter_module("containerd_shim", log_level)
-        .filter_module("vmm_task", log_level)
-        .init();
+async fn initialize() -> anyhow::Result<TaskConfig> {
+    early_init_call().await?;
+
+    let config = TaskConfig::new().await?;
+    trace::set_enabled(config.enable_tracing);
+    init_logger(&config.log_level)?;
+
     info!("Task server start with config: {:?}", config);
+
     match &*config.sharefs_type {
         "9p" => {
-            mount_static_mounts(SHAREFS_9P_MOUNTS.clone())
-                .await
-                .unwrap();
+            mount_static_mounts(SHAREFS_9P_MOUNTS.clone()).await?;
         }
         "virtiofs" => {
-            mount_static_mounts(SHAREFS_VIRTIOFS_MOUNTS.clone())
-                .await
-                .unwrap();
+            mount_static_mounts(SHAREFS_VIRTIOFS_MOUNTS.clone()).await?;
         }
         _ => {
             warn!("sharefs_type should be either 9p or virtiofs");
@@ -165,23 +170,74 @@ async fn main() {
     }
     if config.debug {
         debug!("listen vsock port 1025 for debug console");
-        if let Err(e) = listen_debug_console("vsock://-1:1025").await {
+        if let Err(e) = listen_debug_console("vsock://-1:1025", &config.debug_shell).await {
             error!("failed to listen debug console port, {:?}", e);
         }
     }
 
-    late_init_call().await.expect("late init call");
+    late_init_call().await?;
 
-    // Start ttrpc server
-    let mut server = start_ttrpc_server()
-        .await
-        .expect("failed to create ttrpc server");
-    server.start().await.expect("failed to start ttrpc server");
+    Ok(config)
+}
 
-    let signals = Signals::new([libc::SIGTERM, libc::SIGINT, libc::SIGPIPE, libc::SIGCHLD])
-        .expect("new signal failed");
+fn init_logger(log_level: &str) -> anyhow::Result<()> {
+    let env_filter = EnvFilter::from_default_env()
+        .add_directive(format!("containerd_shim={}", log_level).parse()?)
+        .add_directive(format!("vmm_task={}", log_level).parse()?);
+
+    let mut layers = vec![tracing_subscriber::fmt::layer().boxed()];
+    // TODO: shutdown tracer provider when is_enabled is false
+    if trace::is_enabled() {
+        let tracer = trace::init_otlp_tracer("kuasar-vmm-task-service")
+            .map_err(|e| anyhow!("failed to init otlp tracer: {}", e))?;
+        layers.push(tracing_opentelemetry::layer().with_tracer(tracer).boxed());
+    }
+
+    Registry::default()
+        .with(env_filter)
+        .with(layers)
+        .try_init()?;
+    Ok(())
+}
+
+#[tokio::main]
+async fn main() {
+    let config = match initialize().await {
+        Ok(c) => c,
+        Err(e) => {
+            error!("failed to do init call:: {:?}", e);
+            exit(-1);
+        }
+    };
+    // Keep server alive in main function
+    let mut server = match create_ttrpc_server().await {
+        Ok(s) => s,
+        Err(e) => {
+            error!("failed to create ttrpc server: {:?}", e);
+            exit(-1);
+        }
+    };
+    if let Err(e) = server.start().await {
+        error!("failed to start ttrpc server: {:?}", e);
+        exit(-1);
+    }
+
+    let signals = match Signals::new([
+        libc::SIGTERM,
+        libc::SIGINT,
+        libc::SIGPIPE,
+        libc::SIGCHLD,
+        libc::SIGUSR1,
+    ]) {
+        Ok(s) => s,
+        Err(e) => {
+            error!("new signal failed: {:?}", e);
+            exit(-1);
+        }
+    };
+
     info!("Task server successfully started, waiting for exit signal...");
-    handle_signals(signals).await;
+    handle_signals(signals, &config.log_level).await;
 }
 
 // Do some initialization before everything starts.
@@ -195,7 +251,7 @@ async fn early_init_call() -> Result<()> {
     Ok(())
 }
 
-async fn handle_signals(signals: Signals) {
+async fn handle_signals(signals: Signals, log_level: &str) {
     let mut signals = signals.fuse();
     while let Some(sig) = signals.next().await {
         match sig {
@@ -266,6 +322,10 @@ async fn handle_signals(signals: Signals) {
                     } // stick until exit
                 }
             },
+            libc::SIGUSR1 => {
+                trace::set_enabled(!trace::is_enabled());
+                let _ = init_logger(log_level);
+            }
             _ => {
                 if let Ok(sig) = nix::sys::signal::Signal::try_from(sig) {
                     debug!("received {}", sig);
@@ -277,17 +337,42 @@ async fn handle_signals(signals: Signals) {
     }
 }
 
+lazy_static! {
+    static ref DEFAULT_SYSCTL: HashMap<&'static str, &'static str> = {
+        let mut map = HashMap::new();
+
+        // Enable memory hierarchical account.
+        // For more information see https://www.kernel.org/doc/Documentation/cgroup-v1/memory.txt
+        map.insert("/sys/fs/cgroup/memory/memory.use_hierarchy", "1");
+
+        // Set overcommit_memory to 1, allowing the kernel to overcommit memory,
+        // allocate more memory than is physically available
+        map.insert("/proc/sys/vm/overcommit_memory", "1");
+
+        // Enable automatic expiration of nodest connections in IPVS
+        map.insert("/proc/sys/net/ipv4/vs/expire_nodest_conn", "1");
+        map
+    };
+}
+
 async fn init_vm_rootfs() -> Result<()> {
     let mounts = VM_ROOTFS_MOUNTS.clone();
     mount_static_mounts(mounts).await?;
     // has to mount /proc before find cgroup mounts
     let cgroup_mounts = get_cgroup_mounts(PROC_CGROUPS, false).await?;
     mount_static_mounts(cgroup_mounts).await?;
-    // Enable memory hierarchical account.
-    // For more information see https://www.kernel.org/doc/Documentation/cgroup-v1/memory.txt
-    tokio::fs::write("/sys/fs/cgroup/memory/memory.use_hierarchy", "1")
-        .await
-        .map_err(io_error!(e, "failed to set cgroup hierarchy to 1"))
+
+    // Set default sysctl
+    for sysctl in DEFAULT_SYSCTL.iter() {
+        if !Path::new(&sysctl.0).exists() {
+            continue;
+        }
+        tokio::fs::write(&sysctl.0, &sysctl.1)
+            .await
+            .map_err(io_error!(e, "failed to write kernel parameter "))?;
+    }
+
+    Ok(())
 }
 
 // Continue to do initialization that depend on shared path.
@@ -306,9 +391,6 @@ async fn late_init_call() -> Result<()> {
     } else {
         warn!("unable to find DNS files in kuasar state dir");
     }
-
-    // Setup sandbox namespace
-    setup_sandbox_ns().await?;
 
     Ok(())
 }
@@ -339,74 +421,22 @@ async fn mount_static_mounts(mounts: Vec<StaticMount>) -> Result<()> {
     Ok(())
 }
 
-// start_ttrpc_server will create all the ttrpc service and register them to a server that
+// create_ttrpc_server will create all the ttrpc service and register them to a server that
 // bind to vsock 1024 port.
-async fn start_ttrpc_server() -> Result<Server> {
-    let task = create_task_service().await;
+async fn create_ttrpc_server() -> anyhow::Result<Server> {
+    let (tx, rx) = channel(128);
+    let task = create_task_service(tx).await?;
     let task_service = create_task(Arc::new(Box::new(task)));
 
-    let sandbox = SandboxService::new()?;
+    let sandbox = SandboxService::new(rx)?;
     sandbox.handle_localhost().await?;
     let sandbox_service = create_sandbox_service(Arc::new(Box::new(sandbox)));
+
+    let streaming_service = create_streaming(Arc::new(Box::new(STREAMING_SERVICE.clone())));
 
     Ok(Server::new()
         .bind("vsock://-1:1024")?
         .register_service(task_service)
-        .register_service(sandbox_service))
-}
-
-async fn setup_sandbox_ns() -> Result<()> {
-    setup_persistent_ns(vec![
-        String::from(IPC_NAMESPACE),
-        String::from(UTS_NAMESPACE),
-    ])
-    .await?;
-    Ok(())
-}
-
-async fn setup_persistent_ns(ns_types: Vec<String>) -> Result<()> {
-    if ns_types.is_empty() {
-        return Ok(());
-    }
-    mkdir(SANDBOX_NS_PATH, 0o711).await?;
-
-    let mut clone_type = CloneFlags::empty();
-
-    for ns_type in &ns_types {
-        let sandbox_ns_path = format!("{}/{}", SANDBOX_NS_PATH, ns_type);
-        File::create(&sandbox_ns_path).await.map_err(io_error!(
-            e,
-            "failed to create: {}",
-            sandbox_ns_path
-        ))?;
-
-        clone_type |= *CLONE_FLAG_TABLE
-            .get(ns_type)
-            .ok_or(other!("bad ns type {}", ns_type))?;
-    }
-
-    thread::spawn(move || {
-        unshare(clone_type).expect("failed to do unshare");
-        // set hostname
-        let hostname = std::fs::read_to_string(Path::new(KUASAR_STATE_DIR).join(HOSTNAME_FILENAME))
-            .map(|s| s.trim().to_string())
-            .unwrap_or_default();
-        if !hostname.is_empty() {
-            nix::unistd::sethostname(hostname).expect("set hostname");
-        }
-
-        for ns_type in &ns_types {
-            let sandbox_ns_path = format!("{}/{}", SANDBOX_NS_PATH, ns_type);
-            let ns_path = format!("/proc/{}/task/{}/ns/{}", getpid(), gettid(), ns_type);
-            mount(
-                Some("none"),
-                Some(ns_path.as_str()),
-                &["bind".to_string()],
-                &sandbox_ns_path,
-            )
-            .expect("failed to mount sandbox ns");
-        }
-    });
-
-    Ok(())
+        .register_service(sandbox_service)
+        .register_service(streaming_service))
 }

@@ -16,7 +16,10 @@ limitations under the License.
 
 use std::{
     collections::HashMap,
-    os::unix::io::{AsRawFd, FromRawFd, RawFd},
+    os::{
+        fd::OwnedFd,
+        unix::io::{AsRawFd, FromRawFd, RawFd},
+    },
     time::{Duration, SystemTime},
 };
 
@@ -38,18 +41,11 @@ use tokio::{
 };
 use unshare::Fd;
 
-use self::{
-    config::StratoVirtVMConfig,
-    devices::{pcie_rootbus::PcieRootBus, rootport::RootPort, PCIE_ROOTBUS_CAPACITY},
-    factory::StratoVirtVMFactory,
-    hooks::StratoVirtHooks,
-};
+use self::devices::{pcie_rootbus::PcieRootBus, rootport::RootPort, PCIE_ROOTBUS_CAPACITY};
 use crate::{
-    args::Args,
     device::{Bus, BusType, DeviceInfo, Slot, SlotStatus},
-    impl_recoverable, load_config,
+    impl_recoverable,
     param::ToCmdLineParams,
-    sandbox::KuasarSandboxer,
     stratovirt::{
         config::StratoVirtConfig,
         devices::{
@@ -87,7 +83,8 @@ pub struct StratoVirtVM {
     devices: Vec<Box<dyn StratoVirtDevice + Sync + Send>>,
     #[serde(skip)]
     hot_attached_devices: Vec<Box<dyn StratoVirtHotAttachable + Sync + Send>>,
-    fds: Vec<RawFd>,
+    #[serde(skip)]
+    fds: Vec<OwnedFd>,
     console_socket: String,
     agent_socket: String,
     netns: String,
@@ -149,7 +146,7 @@ impl VM for StratoVirtVM {
         self.pids.vmm_pid = Some(vmm_pid);
         if let Some(virtiofsd) = &self.virtiofs_daemon {
             if let Some(pid) = virtiofsd.pid {
-                self.pids.affilicated_pids.push(pid);
+                self.pids.affiliated_pids.push(pid);
             }
         }
 
@@ -245,7 +242,30 @@ impl VM for StratoVirtVM {
         }
     }
 
-    async fn hot_detach(&mut self, _id: &str) -> Result<()> {
+    async fn hot_detach(&mut self, id: &str) -> Result<()> {
+        let index = self.hot_attached_devices.iter().position(|x| x.id() == id);
+        let device = match index {
+            None => {
+                return Ok(());
+            }
+            Some(index) => self.hot_attached_devices.remove(index),
+        };
+
+        let client = match self.get_client() {
+            Ok(c) => c,
+            Err(e) => {
+                // rollback, add it back to the list
+                self.hot_attached_devices.push(device);
+                return Err(e);
+            }
+        };
+
+        if let Err(e) = device.execute_hot_detach(client).await {
+            // rollback, add it back to the list
+            self.hot_attached_devices.push(device);
+            return Err(e);
+        }
+        self.detach_from_bus(id);
         Ok(())
     }
 
@@ -265,12 +285,12 @@ impl VM for StratoVirtVM {
 
     async fn vcpus(&self) -> Result<VcpuThreads> {
         let client = self.get_client()?;
-        let result = client.execute(qmp::query_cpus {}).await?;
+        let result = client.execute(qmp::QueryCpus {}).await?;
         let mut vcpu_threads_map: HashMap<i64, i64> = HashMap::new();
         for vcpu_info in result.iter() {
             match vcpu_info {
-                CpuInfo::Arm { base, .. } | CpuInfo::x86 { base, .. } => {
-                    vcpu_threads_map.insert(base.CPU, base.thread_id);
+                CpuInfo::Arm { base, .. } | CpuInfo::X86 { base, .. } => {
+                    vcpu_threads_map.insert(base.cpu, base.thread_id);
                 }
             }
         }
@@ -309,17 +329,17 @@ impl StratoVirtVM {
         self.devices.push(Box::new(device));
     }
 
-    fn append_fd(&mut self, fd: RawFd) -> usize {
+    fn append_fd(&mut self, fd: OwnedFd) -> usize {
         self.fds.push(fd);
         self.fds.len() - 1 + 3
     }
 
-    async fn launch(&self) -> Result<Receiver<(u32, i128)>> {
+    async fn launch(&mut self) -> Result<Receiver<(u32, i128)>> {
         let mut params = self.config.to_cmdline_params("-");
         for d in self.devices.iter() {
             params.extend(d.to_cmdline_params("-"));
         }
-        let fds = self.fds.to_vec();
+        let fds: Vec<OwnedFd> = self.fds.drain(..).collect();
         let path = self.config.path.to_string();
         // pid file should not be empty
         let pid_file = self.config.pid_file.to_string();
@@ -335,11 +355,11 @@ impl StratoVirtVM {
             let mut cmd = unshare::Command::new(&*path_clone);
             cmd.args(params.as_slice());
 
-            for (i, &x) in fds.iter().enumerate() {
-                cmd.file_descriptor(
-                    (3 + i) as RawFd,
-                    Fd::from_file(unsafe { std::fs::File::from_raw_fd(x) }),
-                );
+            let pipe_writer2 = pipe_writer.try_clone()?;
+            cmd.stdout(unshare::Stdio::from_file(pipe_writer));
+            cmd.stderr(unshare::Stdio::from_file(pipe_writer2));
+            for (i, x) in fds.into_iter().enumerate() {
+                cmd.file_descriptor((3 + i) as RawFd, Fd::from_file(std::fs::File::from(x)));
             }
 
             if !netns.is_empty() {
@@ -347,9 +367,6 @@ impl StratoVirtVM {
                     .map_err(|e| anyhow!("failed to open netns {}", e))?;
                 cmd.set_namespace(&netns_fd, unshare::Namespace::Net)?;
             }
-            let pipe_writer2 = pipe_writer.try_clone()?;
-            cmd.stdout(unshare::Stdio::from_file(pipe_writer));
-            cmd.stderr(unshare::Stdio::from_file(pipe_writer2));
             let mut child = cmd
                 .spawn()
                 .map_err(|e| anyhow!("failed to spawn stratovirt command: {}", e))?;
@@ -550,19 +567,24 @@ impl StratoVirtVM {
             .start()
             .map_err(|e| Error::Other(anyhow!("start virtiofs daemon process failed: {}", e)))
     }
+
+    fn detach_from_bus(&mut self, device_id: &str) {
+        self.devices
+            .iter_mut()
+            .filter_map(|x| x.bus())
+            .for_each(|b| {
+                if let Some(x) = b.slots.iter_mut().find(|s| {
+                    if let SlotStatus::Occupied(id) = &s.status {
+                        if id == device_id {
+                            return true;
+                        }
+                    }
+                    false
+                }) {
+                    x.status = SlotStatus::Empty;
+                }
+            });
+    }
 }
 
 impl_recoverable!(StratoVirtVM);
-
-pub async fn init_stratovirt_sandboxer(
-    args: &Args,
-) -> Result<KuasarSandboxer<StratoVirtVMFactory, StratoVirtHooks>> {
-    let (config, persist_dir_path) =
-        load_config::<StratoVirtVMConfig>(args, CONFIG_STRATOVIRT_PATH).await?;
-    let hooks = StratoVirtHooks::new(config.hypervisor.clone());
-    let mut s = KuasarSandboxer::new(config.sandbox, config.hypervisor, hooks);
-    if !persist_dir_path.is_empty() {
-        s.recover(&persist_dir_path).await?;
-    }
-    Ok(s)
-}

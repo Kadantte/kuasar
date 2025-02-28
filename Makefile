@@ -9,8 +9,18 @@ INSTALL_DIR := /var/lib/kuasar
 BIN_DIR := /usr/local/bin
 SYSTEMD_SERVICE_DIR := /usr/lib/systemd/system
 SYSTEMD_CONF_DIR := /etc/sysconfig
+ENABLE_YOUKI ?= false
+RUNC_FEATURES =
+VMM_TASK_FEATURES =
 
-.PHONY: vmm wasm quark clean all install-vmm install-wasm install-quark install
+ifeq ($(ENABLE_YOUKI), true)
+	RUNC_FEATURES = youki
+	VMM_TASK_FEATURES = youki
+endif
+
+.PHONY: vmm wasm quark clean all install-vmm install-wasm install-quark install \
+        bin/vmm-sandboxer bin/vmm-task bin/vmlinux.bin bin/kuasar.img bin/kuasar.initrd \
+        bin/wasm-sandboxer bin/quark-sandboxer bin/runc-sandboxer
 
 all: vmm quark wasm
 
@@ -19,7 +29,7 @@ bin/vmm-sandboxer:
 	@mkdir -p bin && cp vmm/sandbox/target/release/${HYPERVISOR} bin/vmm-sandboxer
 
 bin/vmm-task:
-	@cd vmm/task && cargo build --release --target=${ARCH}-unknown-linux-musl
+	@cd vmm/task && cargo build --release --target=${ARCH}-unknown-linux-musl --features=${VMM_TASK_FEATURES}
 	@mkdir -p bin && cp vmm/task/target/${ARCH}-unknown-linux-musl/release/vmm-task bin/vmm-task
 
 bin/vmlinux.bin:
@@ -27,11 +37,11 @@ bin/vmlinux.bin:
 	@mkdir -p bin && cp vmm/scripts/kernel/${HYPERVISOR}/vmlinux.bin bin/vmlinux.bin && rm vmm/scripts/kernel/${HYPERVISOR}/vmlinux.bin
 
 bin/kuasar.img:
-	@bash vmm/scripts/image/${GUESTOS_IMAGE}/build.sh image
+	@bash vmm/scripts/image/build.sh image ${GUESTOS_IMAGE}
 	@mkdir -p bin && cp /tmp/kuasar.img bin/kuasar.img && rm /tmp/kuasar.img
 
 bin/kuasar.initrd:
-	@bash vmm/scripts/image/${GUESTOS_IMAGE}/build.sh initrd
+	@bash vmm/scripts/image/build.sh initrd ${GUESTOS_IMAGE}
 	@mkdir -p bin && cp /tmp/kuasar.initrd bin/kuasar.initrd && rm /tmp/kuasar.initrd
 
 bin/wasm-sandboxer:
@@ -43,17 +53,18 @@ bin/quark-sandboxer:
 	@mkdir -p bin && cp quark/target/release/quark-sandboxer bin/quark-sandboxer
 
 bin/runc-sandboxer:
-	@cd runc && cargo build --release
+	@cd runc && cargo build --release --features=${RUNC_FEATURES}
 	@mkdir -p bin && cp runc/target/release/runc-sandboxer bin/runc-sandboxer
 
 wasm: bin/wasm-sandboxer
 quark: bin/quark-sandboxer
 runc: bin/runc-sandboxer
 
-ifeq ($(HYPERVISOR), stratovirt)
-vmm: bin/vmm-sandboxer bin/kuasar.initrd bin/vmlinux.bin
-else
+ifeq ($(HYPERVISOR), cloud_hypervisor)
 vmm: bin/vmm-sandboxer bin/kuasar.img bin/vmlinux.bin
+else
+# stratovirt or qemu
+vmm: bin/vmm-sandboxer bin/kuasar.initrd bin/vmlinux.bin
 endif
 
 clean:
@@ -74,12 +85,13 @@ install-vmm:
 	@install -d -m 750 ${DEST_DIR}${SYSTEMD_CONF_DIR}
 	@install -p -m 640 vmm/service/kuasar-vmm ${DEST_DIR}${SYSTEMD_CONF_DIR}/kuasar-vmm
 
-ifeq ($(HYPERVISOR), stratovirt)
-	@install -p -m 640 bin/kuasar.initrd ${DEST_DIR}${INSTALL_DIR}/kuasar.initrd
-	@install -p -m 640 vmm/sandbox/config_stratovirt_${ARCH}.toml ${DEST_DIR}${INSTALL_DIR}/config_stratovirt.toml
-else
+ifeq ($(HYPERVISOR), cloud_hypervisor)
 	@install -p -m 640 bin/kuasar.img ${DEST_DIR}${INSTALL_DIR}/kuasar.img
-	@install -p -m 640 vmm/sandbox/config_clh.toml ${DEST_DIR}${INSTALL_DIR}/config_clh.toml
+	@install -p -m 640 vmm/sandbox/config_clh.toml ${DEST_DIR}${INSTALL_DIR}/config.toml
+else
+# stratovirt or qemu
+	@install -p -m 640 bin/kuasar.initrd ${DEST_DIR}${INSTALL_DIR}/kuasar.initrd
+	@install -p -m 640 vmm/sandbox/config_${HYPERVISOR}_${ARCH}.toml ${DEST_DIR}${INSTALL_DIR}/config.toml
 endif
 
 install-wasm:

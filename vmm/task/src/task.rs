@@ -25,39 +25,46 @@ use containerd_shim::{
         util::read_spec,
     },
     monitor::{Subject, Topic},
+    protos::protobuf::MessageDyn,
 };
 use log::{debug, error};
 use oci_spec::runtime::{LinuxNamespaceType, Spec};
-use tokio::sync::{mpsc::channel, Mutex};
+use tokio::sync::{mpsc::Sender, Mutex};
 
-use crate::{
-    container::{KuasarContainer, KuasarFactory},
-    sandbox::SandboxResources,
-};
+#[cfg(not(feature = "youki"))]
+use crate::container::{KuasarContainer, KuasarFactory};
+#[cfg(feature = "youki")]
+use crate::youki::{YoukiContainer, YoukiFactory};
+use crate::{sandbox::SandboxResources, NAMESPACE};
 
-pub(crate) async fn create_task_service() -> TaskService<KuasarFactory, KuasarContainer> {
-    let (tx, mut rx) = channel(128);
+#[cfg(not(feature = "youki"))]
+type Factory = KuasarFactory;
+#[cfg(not(feature = "youki"))]
+type RealContainer = KuasarContainer;
+
+#[cfg(feature = "youki")]
+type Factory = YoukiFactory;
+#[cfg(feature = "youki")]
+type RealContainer = YoukiContainer;
+
+pub(crate) async fn create_task_service(
+    tx: Sender<(String, Box<dyn MessageDyn>)>,
+) -> anyhow::Result<TaskService<Factory, RealContainer>> {
     let sandbox = Arc::new(Mutex::new(SandboxResources::new().await));
     let task = TaskService {
-        factory: KuasarFactory::new(sandbox),
+        factory: Factory::new(sandbox),
         containers: Arc::new(Default::default()),
-        namespace: "k8s.io".to_string(),
+        namespace: NAMESPACE.to_string(),
         exit: Arc::new(Default::default()),
-        tx: tx.clone(),
+        tx,
     };
-    let s = monitor_subscribe(Topic::Pid)
-        .await
-        .expect("monitor subscribe failed");
+    let s = monitor_subscribe(Topic::Pid).await?;
     process_exits(s, &task).await;
-    tokio::spawn(async move {
-        while let Some((_topic, e)) = rx.recv().await {
-            debug!("received event {:?}", e);
-        }
-    });
-    task
+
+    Ok(task)
 }
 
-async fn process_exits(s: Subscription, task: &TaskService<KuasarFactory, KuasarContainer>) {
+async fn process_exits(s: Subscription, task: &TaskService<Factory, RealContainer>) {
     let containers = task.containers.clone();
     let mut s = s;
     tokio::spawn(async move {
